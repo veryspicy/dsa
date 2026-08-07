@@ -13,11 +13,24 @@ from typing import List, Optional, Tuple
 
 from sqlalchemy import and_, delete, desc, func, or_, select
 
+from src.core.backtest_engine import OVERALL_SENTINEL_CODE
+from src.services.stock_code_utils import resolve_daily_stock_identity
+
 from src.storage import BacktestResult, BacktestSummary, DatabaseManager, AnalysisHistory
 
 logger = logging.getLogger(__name__)
 
 MARKET_REVIEW_REPORT_TYPE = "market_review"
+BacktestResultContextRow = Tuple[
+    BacktestResult,
+    Optional[str],
+    Optional[str],
+    Optional[datetime],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[int],
+]
 
 
 class BacktestRepository:
@@ -32,6 +45,7 @@ class BacktestRepository:
         code: Optional[str],
         min_age_days: int,
         limit: int,
+        offset: int = 0,
         eval_window_days: int,
         engine_version: str,
         force: bool,
@@ -42,7 +56,7 @@ class BacktestRepository:
         with self.db.get_session() as session:
             conditions = [AnalysisHistory.created_at <= cutoff_dt]
             if code:
-                conditions.append(AnalysisHistory.code == code)
+                conditions.extend(self._build_code_conditions(AnalysisHistory.code, code))
             conditions.append(
                 or_(
                     AnalysisHistory.report_type.is_(None),
@@ -61,9 +75,67 @@ class BacktestRepository:
                 )
                 query = query.where(AnalysisHistory.id.not_in(existing_ids))
 
-            query = query.order_by(desc(AnalysisHistory.created_at)).limit(limit)
+            query = query.order_by(desc(AnalysisHistory.created_at)).offset(offset).limit(limit)
             rows = session.execute(query).scalars().all()
             return list(rows)
+
+    def align_existing_result_dates(
+        self,
+        *,
+        code: Optional[str],
+        min_age_days: int,
+        eval_window_days: int,
+        engine_version: str,
+        analysis_date_from: Optional[date],
+        analysis_date_to: Optional[date],
+    ) -> int:
+        """Align legacy result dates to their linked analysis snapshot date.
+
+        Older backtest rows may have stored the trading/start daily date instead
+        of the historical analysis snapshot date. When a date-filtered run skips
+        already-existing rows, those legacy rows would remain invisible to the
+        same date-filtered result query. Updating the stored result date keeps
+        rerun and query semantics aligned without inserting duplicate rows.
+        """
+        cutoff_dt = datetime.now() - timedelta(days=min_age_days)
+
+        with self.db.get_session() as session:
+            conditions = [
+                AnalysisHistory.created_at <= cutoff_dt,
+                BacktestResult.eval_window_days == eval_window_days,
+                BacktestResult.engine_version == engine_version,
+                or_(
+                    AnalysisHistory.report_type.is_(None),
+                    AnalysisHistory.report_type != MARKET_REVIEW_REPORT_TYPE,
+                ),
+            ]
+            if code:
+                conditions.extend(self._build_code_conditions(AnalysisHistory.code, code))
+
+            rows = session.execute(
+                select(BacktestResult, AnalysisHistory)
+                .join(AnalysisHistory, AnalysisHistory.id == BacktestResult.analysis_history_id)
+                .where(and_(*conditions))
+            ).all()
+
+            updated = 0
+            for result, analysis in rows:
+                analysis_date = self.parse_analysis_date_from_snapshot(analysis.context_snapshot)
+                if analysis_date is None and analysis.created_at is not None:
+                    analysis_date = analysis.created_at.date()
+                if analysis_date is None:
+                    continue
+                if analysis_date_from is not None and analysis_date < analysis_date_from:
+                    continue
+                if analysis_date_to is not None and analysis_date > analysis_date_to:
+                    continue
+                if result.analysis_date != analysis_date:
+                    result.analysis_date = analysis_date
+                    updated += 1
+
+            if updated:
+                session.commit()
+            return updated
 
     def save_result(self, result: BacktestResult) -> None:
         with self.db.get_session() as session:
@@ -111,7 +183,7 @@ class BacktestRepository:
         days: Optional[int],
         offset: int,
         limit: int,
-    ) -> Tuple[List[Tuple[BacktestResult, Optional[str], Optional[str], Optional[datetime], Optional[str]]], int]:
+    ) -> Tuple[List[BacktestResultContextRow], int]:
         with self.db.get_session() as session:
             conditions = self._build_result_conditions(
                 code=code,
@@ -137,6 +209,9 @@ class BacktestRepository:
                     AnalysisHistory.trend_prediction,
                     AnalysisHistory.created_at,
                     AnalysisHistory.context_snapshot,
+                    AnalysisHistory.raw_result,
+                    AnalysisHistory.report_type,
+                    AnalysisHistory.sentiment_score,
                 )
                 .join(AnalysisHistory, AnalysisHistory.id == BacktestResult.analysis_history_id)
                 .where(where_clause)
@@ -157,7 +232,7 @@ class BacktestRepository:
         days: Optional[int],
         offset: int,
         limit: int,
-    ) -> List[Tuple[BacktestResult, Optional[str], Optional[str], Optional[datetime], Optional[str]]]:
+    ) -> List[BacktestResultContextRow]:
         """Return result rows plus AnalysisHistory.context_snapshot for dynamic filtering."""
         with self.db.get_session() as session:
             conditions = self._build_result_conditions(
@@ -176,6 +251,9 @@ class BacktestRepository:
                     AnalysisHistory.trend_prediction,
                     AnalysisHistory.created_at,
                     AnalysisHistory.context_snapshot,
+                    AnalysisHistory.raw_result,
+                    AnalysisHistory.report_type,
+                    AnalysisHistory.sentiment_score,
                 )
                 .join(AnalysisHistory, AnalysisHistory.id == BacktestResult.analysis_history_id)
                 .where(where_clause)
@@ -332,9 +410,10 @@ class BacktestRepository:
         with self.db.get_session() as session:
             conditions = [
                 BacktestSummary.scope == scope,
-                BacktestSummary.code == code,
                 BacktestSummary.engine_version == engine_version,
             ]
+            if code:
+                conditions.extend(self._build_code_conditions(BacktestSummary.code, code))
             if eval_window_days is not None:
                 conditions.append(BacktestSummary.eval_window_days == eval_window_days)
 
@@ -411,7 +490,7 @@ class BacktestRepository:
     ) -> List[object]:
         conditions = []
         if code:
-            conditions.append(BacktestResult.code == code)
+            conditions.extend(BacktestRepository._build_code_conditions(BacktestResult.code, code))
         if eval_window_days is not None:
             conditions.append(BacktestResult.eval_window_days == eval_window_days)
         if engine_version:
@@ -424,3 +503,28 @@ class BacktestRepository:
             cutoff = datetime.now() - timedelta(days=int(days))
             conditions.append(BacktestResult.evaluated_at >= cutoff)
         return conditions
+
+    @staticmethod
+    def _build_code_conditions(column, code: str) -> List[object]:
+        if not code:
+            return []
+
+        raw_code = str(code).strip()
+        if raw_code.lower() == OVERALL_SENTINEL_CODE.lower():
+            raw_code = OVERALL_SENTINEL_CODE
+        else:
+            raw_code = raw_code.upper()
+
+        if raw_code == OVERALL_SENTINEL_CODE:
+            candidates = [OVERALL_SENTINEL_CODE]
+        else:
+            identity = resolve_daily_stock_identity(raw_code)
+            candidates = list(identity.code_candidates) if identity is not None else []
+        if not candidates:
+            return [column.in_([])]
+
+        if len(candidates) == 1:
+            return [column == candidates[0]]
+
+        unique = list(dict.fromkeys(candidates))
+        return [or_(*[column == candidate for candidate in unique])]

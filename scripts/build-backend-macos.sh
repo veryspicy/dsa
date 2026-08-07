@@ -44,8 +44,14 @@ log "Installing backend dependencies..."
 log "Checking python-multipart availability..."
 "${PYTHON_BIN}" -c "import multipart, multipart.multipart"
 
-log "Checking AlphaSift adapter availability..."
-"${PYTHON_BIN}" -c "import alphasift.dsa_adapter"
+log "Checking built-in screening engine availability..."
+"${PYTHON_BIN}" -c "import src.services.screening.pipeline"
+
+log "Checking Futu SDK availability..."
+"${PYTHON_BIN}" -c "import futu"
+
+log "Checking orjson availability..."
+"${PYTHON_BIN}" -c "import orjson"
 
 if [[ -d "${ROOT_DIR}/dist/backend" ]]; then
   rm -rf "${ROOT_DIR}/dist/backend"
@@ -77,7 +83,7 @@ hidden_imports=(
   "api.v1.endpoints.history"
   "api.v1.endpoints.stocks"
   "api.v1.endpoints.health"
-  "api.v1.endpoints.alphasift"
+  "api.v1.endpoints.screening"
   "api.v1.schemas"
   "api.v1.schemas.analysis"
   "api.v1.schemas.history"
@@ -89,9 +95,10 @@ hidden_imports=(
   "src.services.task_queue"
   "src.services.analysis_service"
   "src.services.history_service"
-  "src.services.alphasift_service"
-  "alphasift"
-  "alphasift.dsa_adapter"
+  "src.services.screening_service"
+  "src.services.screening"
+  "src.services.screening.pipeline"
+  "orjson"
   "uvicorn.logging"
   "uvicorn.loops"
   "uvicorn.loops.auto"
@@ -110,8 +117,9 @@ for module in "${hidden_imports[@]}"; do
 done
 
 pushd "${ROOT_DIR}" >/dev/null
-cmd=("${PYTHON_BIN}" -m PyInstaller --name stock_analysis --onedir --noconfirm --noconsole --add-data "static:static" --add-data "strategies:strategies" --collect-data litellm --collect-data tiktoken)
-cmd+=("--collect-all" "alphasift")
+cmd=("${PYTHON_BIN}" -m PyInstaller --name stock_analysis --onedir --noconfirm --noconsole --runtime-hook "${SCRIPT_DIR}/pyinstaller_runtime_compat.py" --add-data "static:static" --add-data "strategies:strategies" --add-data "src/assets/share_image:src/assets/share_image" --collect-data litellm --collect-data tiktoken --collect-data akshare)
+cmd+=("--collect-all" "src.services.screening")
+cmd+=("--collect-all" "futu")
 cmd+=("${hidden_import_args[@]}" "main.py")
 
 echo "Running: ${cmd[*]}"
@@ -120,92 +128,42 @@ popd >/dev/null
 
 cp -R "${ROOT_DIR}/dist/stock_analysis" "${ROOT_DIR}/dist/backend/stock_analysis"
 
-log "Verifying packaged AlphaSift importability..."
 packaged_root="${ROOT_DIR}/dist/backend/stock_analysis"
 
+log "Removing invalid signatures before the packaged backend is executed..."
+bash "${SCRIPT_DIR}/macos-signature-audit.sh" normalize "${packaged_root}"
+
+log "Verifying packaged runtime imports..."
 packaged_entry="${packaged_root}/stock_analysis"
 if [[ ! -x "${packaged_entry}" ]]; then
   echo "ERROR: packaged backend entrypoint not found or not executable: ${packaged_entry}."
   exit 1
 fi
 
-# 先校验可执行文件可启动（不进入业务流程的参数），再检查冻结产物中是否携带 alphasift.
-if ! "${packaged_entry}" --help >/tmp/alphasift-packaged-help.log 2>&1; then
+# 先校验可执行文件可启动（不进入业务流程的参数），再检查冻结产物中的关键依赖。
+if ! "${packaged_entry}" --help >/tmp/dsa-packaged-help.log 2>&1; then
   echo "ERROR: packaged backend help startup check failed."
-  cat /tmp/alphasift-packaged-help.log
+  cat /tmp/dsa-packaged-help.log
   exit 1
 fi
 
-if "${PYTHON_BIN}" -S - <<'PY' "${packaged_root}"
-import pathlib
-import sys
-import zipfile
-import importlib
+for module in src.services.screening.pipeline futu orjson; do
+  if DSA_PACKAGED_IMPORT_PROBE="${module}" "${packaged_entry}" >/tmp/dsa-packaged-import.log 2>&1; then
+    cat /tmp/dsa-packaged-import.log
+  else
+    echo "ERROR: packaged backend artifact cannot import ${module}."
+    cat /tmp/dsa-packaged-import.log
+    exit 1
+  fi
+done
 
-
-def _as_importable_paths(root: pathlib.Path):
-    candidates = [root]
-    internal = root / "_internal"
-    if internal.is_dir():
-        candidates.append(internal)
-
-    for base in candidates:
-        yield base
-        for archive_name in ("*.pyz", "*.zip"):
-            for archive in base.glob(archive_name):
-                yield archive
-
-
-def _can_import_from_candidates(root: pathlib.Path) -> bool:
-    for candidate in _as_importable_paths(root):
-        if not candidate.exists():
-            continue
-
-        baseline_path = list(sys.path)
-        sys.path = [str(candidate)]
-        for key in list(sys.modules):
-            if key == "alphasift" or key.startswith("alphasift."):
-                del sys.modules[key]
-
-        try:
-            importlib.invalidate_caches()
-            importlib.import_module("alphasift.dsa_adapter")
-            print(f"OK (import) from: {candidate}")
-            return True
-        except Exception:
-            continue
-        finally:
-            sys.path = baseline_path
-
-    return False
-
-
-def _zip_contains_alphasift_adapter(root: pathlib.Path) -> bool:
-    for candidate in _as_importable_paths(root):
-        if not candidate.is_file() or candidate.suffix not in {".pyz", ".zip"}:
-            continue
-
-        try:
-            with zipfile.ZipFile(candidate, "r") as zf:
-                for name in zf.namelist():
-                    normalized = name.replace("\\", "/").lstrip("/")
-                    if normalized.startswith("alphasift/dsa_adapter.") or normalized.startswith("alphasift/dsa_adapter/"):
-                        print(f"OK (archive) from: {candidate}")
-                        return True
-        except Exception:
-            continue
-
-    return False
-
-
-root = pathlib.Path(sys.argv[1]).resolve()
-if not _can_import_from_candidates(root) and not _zip_contains_alphasift_adapter(root):
-    raise SystemExit(f"Missing alphasift adapter in packaged artifact: {root}")
-PY
-then
-  echo "Verifying packaged AlphaSift importability..."
-else
-  echo "ERROR: packaged backend artifact is missing alphasift modules in ${packaged_root}."
+log "Verifying packaged AkShare calendar data..."
+packaged_akshare_calendar="${packaged_root}/_internal/akshare/file_fold/calendar.json"
+if [[ ! -f "${packaged_akshare_calendar}" ]]; then
+  packaged_akshare_calendar="${packaged_root}/akshare/file_fold/calendar.json"
+fi
+if [[ ! -f "${packaged_akshare_calendar}" ]]; then
+  echo "ERROR: packaged AkShare calendar data not found under ${packaged_root}."
   exit 1
 fi
 
@@ -233,6 +191,22 @@ fi
 packaged_strategy_count="$(find "${packaged_strategies}" -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d '[:space:]')"
 if [[ "${packaged_strategy_count}" != "${source_strategy_count}" ]]; then
   echo "ERROR: packaged strategies count mismatch: expected ${source_strategy_count}, got ${packaged_strategy_count}."
+  exit 1
+fi
+
+log "Verifying packaged screening strategies..."
+source_screening_strategy_count="$(find "${ROOT_DIR}/src/services/screening/strategies" -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d '[:space:]')"
+packaged_screening_strategies="${ROOT_DIR}/dist/backend/stock_analysis/_internal/src/services/screening/strategies"
+if [[ ! -d "${packaged_screening_strategies}" ]]; then
+  packaged_screening_strategies="${ROOT_DIR}/dist/backend/stock_analysis/src/services/screening/strategies"
+fi
+if [[ ! -d "${packaged_screening_strategies}" ]]; then
+  echo "ERROR: packaged screening strategies directory not found under dist/backend/stock_analysis."
+  exit 1
+fi
+packaged_screening_strategy_count="$(find "${packaged_screening_strategies}" -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d '[:space:]')"
+if [[ "${packaged_screening_strategy_count}" != "${source_screening_strategy_count}" ]]; then
+  echo "ERROR: packaged screening strategies count mismatch: expected ${source_screening_strategy_count}, got ${packaged_screening_strategy_count}."
   exit 1
 fi
 

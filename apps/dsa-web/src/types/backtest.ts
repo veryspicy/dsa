@@ -2,7 +2,7 @@
  * Backtest API type definitions
  * Mirrors api/v1/schemas/backtest.py
  */
-import type { MarketPhaseSummary } from './analysis';
+import type { DecisionAction, MarketPhaseSummary } from './analysis';
 
 // ============ Request / Response ============
 
@@ -14,6 +14,8 @@ export interface BacktestRunRequest {
   force?: boolean;
   evalWindowDays?: number;
   minAgeDays?: number;
+  analysisDateFrom?: string;
+  analysisDateTo?: string;
   limit?: number;
 }
 
@@ -23,6 +25,9 @@ export interface BacktestRunResponse {
   completed: number;
   insufficient: number;
   errors: number;
+  appliedEvalWindowDays?: number;
+  message?: string | null;
+  diagnostics?: Record<string, unknown>;
 }
 
 // ============ Result Item ============
@@ -37,6 +42,8 @@ export interface BacktestResultItem {
   evalStatus: string;
   evaluatedAt?: string;
   operationAdvice?: string;
+  action?: DecisionAction | null;
+  actionLabel?: string | null;
   trendPrediction?: string;
   marketPhase?: string | null;
   marketPhaseSummary?: MarketPhaseSummary | null;
